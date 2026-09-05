@@ -8,6 +8,8 @@ until the model answers in prose or the round budget is exhausted.
 """
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,7 +17,7 @@ from rich.console import Console
 from rich.text import Text
 
 from aye.controller.approval import confirm_command
-from aye.model.api import cli_invoke
+from aye.model.api import ApiError, cli_invoke
 from aye.model.tool_protocol import (
     ToolCall,
     build_tools_prompt,
@@ -42,6 +44,32 @@ from aye.model.auth import get_user_config
 # Consecutive all-replay rounds tolerated before the loop declares the
 # model stuck and forces it to answer with what it has.
 _MAX_STALLED_ROUNDS = 3
+
+# Unbounded rounds mean one turn can fire many API calls in quick succession,
+# which trips the backend's rate limiter. A small pause between rounds keeps
+# the request rate civil at negligible wall-clock cost.
+_ROUND_PACING_SECONDS = 1.0
+
+# On a rate-limited round the call is retried with these delays before the
+# turn is paused gracefully. Generous enough to ride out short bursts.
+_RATE_LIMIT_BACKOFF = (3.0, 8.0)
+
+# Matches rate-limit failures surfaced as exception text (ApiError carries
+# the HTTP status separately; demo tokens and backends phrase it in words).
+_RATE_LIMIT_TEXT_RE = re.compile(
+    r"rate limit|too many (?:demo )?requests|http 429\b", re.IGNORECASE
+)
+
+
+class _RateLimitedTurn(Exception):
+    """Rate-limited past all retries; the turn must pause gracefully."""
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True when *exc* is a rate-limit rejection."""
+    if isinstance(exc, ApiError) and exc.status_code == 429:
+        return True
+    return bool(_RATE_LIMIT_TEXT_RE.search(str(exc)))
 
 _DECLINED_SHELL_OUTPUT = "Error: the user declined to run this command."
 
@@ -168,17 +196,30 @@ def _invoke_round(
 
     spinner.start()
     try:
-        api_resp = cli_invoke(
-            chat_id=chat_id,
-            message=followup,
-            source_files=source_files,
-            model=conf.selected_model,
-            system_prompt=system,
-            max_output_tokens=max_output_tokens,
-            telemetry=None,
-            on_stream_update=callback,
-            attachments=attachments,
-        )
+        # A rate-limited round is retried with growing delays; past the last
+        # retry the turn pauses gracefully instead of dying on the spot.
+        attempt = 0
+        while True:
+            try:
+                api_resp = cli_invoke(
+                    chat_id=chat_id,
+                    message=followup,
+                    source_files=source_files,
+                    model=conf.selected_model,
+                    system_prompt=system,
+                    max_output_tokens=max_output_tokens,
+                    telemetry=None,
+                    on_stream_update=callback,
+                    attachments=attachments,
+                )
+                break
+            except Exception as exc:
+                if not _is_rate_limit_error(exc):
+                    raise
+                if attempt >= len(_RATE_LIMIT_BACKOFF):
+                    raise _RateLimitedTurn(str(exc)) from exc
+                time.sleep(_RATE_LIMIT_BACKOFF[attempt])
+                attempt += 1
     finally:
         spinner.stop()
         if display is not None and display.is_active():
@@ -276,6 +317,7 @@ def run_tool_loop(
     # replay). Without a round budget this is the only spinning risk left.
     stalled_rounds = 0
     budget_exhausted = False
+    rate_limited = False
 
     round_index = 0
     while True:
@@ -368,17 +410,21 @@ def run_tool_loop(
         )
         system = _round_system_prompt(base_system_prompt, is_final_round)
 
-        api_resp, display, round_state = _invoke_round(
-            chat_id=chat_id,
-            followup=followup,
-            system=system,
-            conf=conf,
-            source_files=source_files,
-            max_output_tokens=max_output_tokens,
-            attachments=attachments,
-            console=console,
-            stream=stream,
-        )
+        try:
+            api_resp, display, round_state = _invoke_round(
+                chat_id=chat_id,
+                followup=followup,
+                system=system,
+                conf=conf,
+                source_files=source_files,
+                max_output_tokens=max_output_tokens,
+                attachments=attachments,
+                console=console,
+                stream=stream,
+            )
+        except _RateLimitedTurn:
+            rate_limited = True
+            break
         state["summary_already_printed"] = bool(round_state.get("rendered_final"))
         narration_shown = bool(
             display is not None and display.has_received_content()
@@ -394,13 +440,24 @@ def run_tool_loop(
         files.extend(assistant_resp.get("source_files", []))
 
         round_index += 1
+        # Keep the request rate civil; one short pause per round.
+        time.sleep(_ROUND_PACING_SECONDS)
 
-    # The loop ended while the model still requested tools -- either a user
-    # configured cap ran out, or the model kept re-requesting calls it had
-    # already made. Never return the raw tool-call JSON as the answer: force
-    # one final prose round with the tools block removed so the model must
-    # answer directly.
-    if split_summary(summary).calls:
+    # The loop ended while the model still requested tools -- a configured
+    # cap ran out, the model kept re-requesting calls it had already made,
+    # or the API rate limiter paused the turn. Never return the raw
+    # tool-call JSON as the answer: without a rate limit, force one final
+    # prose round with the tools block removed so the model must answer
+    # directly; with one, close the turn with what was accomplished.
+    pause_note = (
+        "The task was paused because the API rate limit was reached. "
+        "Tool results gathered so far are shown above; send the request "
+        "again to continue from there."
+    )
+    if rate_limited:
+        narration = split_summary(summary).narration or pending_narration
+        summary = f"{narration}\n\n{pause_note}" if narration else pause_note
+    elif split_summary(summary).calls:
         reason = (
             "The tool call limit for this request was reached."
             if budget_exhausted
@@ -411,24 +468,32 @@ def run_tool_loop(
             f"{reason} Give your final answer now in prose. Do not request "
             "any more tools."
         )
-        api_resp, display, round_state = _invoke_round(
-            chat_id=chat_id,
-            followup=followup,
-            system=base_system_prompt,
-            conf=conf,
-            source_files=source_files,
-            max_output_tokens=max_output_tokens,
-            attachments=attachments,
-            console=console,
-            stream=stream,
-        )
-        state["summary_already_printed"] = bool(round_state.get("rendered_final"))
+        try:
+            api_resp, display, round_state = _invoke_round(
+                chat_id=chat_id,
+                followup=followup,
+                system=base_system_prompt,
+                conf=conf,
+                source_files=source_files,
+                max_output_tokens=max_output_tokens,
+                attachments=attachments,
+                console=console,
+                stream=stream,
+            )
+        except _RateLimitedTurn:
+            narration = split_summary(summary).narration or pending_narration
+            summary = f"{narration}\n\n{pause_note}" if narration else pause_note
+        else:
+            state["summary_already_printed"] = bool(
+                round_state.get("rendered_final")
+            )
 
-        assistant_resp, chat_id = _parse_api_response(api_resp)
-        # Tools were not offered this round, so a structured tool-call field
-        # (if the backend attaches one anyway) is spurious; keep the prose.
-        summary = assistant_resp.get("answer_summary", "")
-        files.extend(assistant_resp.get("source_files", []))
+            assistant_resp, chat_id = _parse_api_response(api_resp)
+            # Tools were not offered this round, so a structured tool-call
+            # field (if the backend attaches one anyway) is spurious; keep
+            # the prose.
+            summary = assistant_resp.get("answer_summary", "")
+            files.extend(assistant_resp.get("source_files", []))
 
     # Deduplicate files by name, keeping the last occurrence.
     merged: List[Dict[str, Any]] = []

@@ -3,8 +3,20 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
+import aye.controller.tool_loop as tool_loop
 from aye.controller.tool_loop import run_tool_loop
+from aye.model.api import ApiError
 from aye.model.tool_protocol import looks_like_protocol_json
+
+
+@pytest.fixture(autouse=True)
+def _no_loop_sleep(monkeypatch):
+    """Keep pacing and rate-limit backoff from slowing the test suite."""
+    monkeypatch.setattr(
+        tool_loop, "time", SimpleNamespace(sleep=lambda *_: None)
+    )
 
 
 def _resp(answer_summary, source_files=None, chat_id=7):
@@ -336,6 +348,102 @@ class TestToolsDisabled:
         assert summary == _tool_request("read", {"path": "a.py"})
         assert files == []
         assert chat_id == 1
+
+
+class TestRateLimitHandling:
+    """Unbounded rounds must ride out 429s, not die or hammer the API."""
+
+    def test_rate_limited_round_is_retried_and_completes(self, tmp_path, monkeypatch):
+        (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
+        calls = []
+
+        def fake_cli_invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise ApiError("Rate limit reached", status_code=429)
+            return _resp("the notes say hello", chat_id=1)
+
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        summary, _, _ = run_tool_loop(
+            initial_summary=_tool_request("read", {"path": "notes.txt"}),
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+        )
+        assert len(calls) == 3
+        assert summary == "the notes say hello"
+
+    def test_persistent_rate_limit_pauses_the_turn_gracefully(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        def fake_cli_invoke(**kwargs):
+            calls.append(kwargs)
+            raise ApiError("Rate limit reached", status_code=429)
+
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        summary, _, _ = run_tool_loop(
+            initial_summary=_tool_request("read", {"path": "a.py"}),
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+        )
+        # Initial attempt plus the two backoff retries, then a clean stop.
+        assert len(calls) == 3
+        assert "paused because the API rate limit was reached" in summary
+        assert "tool_calls" not in summary
+
+    def test_pause_keeps_the_last_narration(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_cli_invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _resp(
+                    "Found the culprit.\n" + _tool_request("read", {"path": "b.py"}),
+                    chat_id=1,
+                )
+            raise ApiError("too many requests, slow down", status_code=429)
+
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        summary, _, _ = run_tool_loop(
+            initial_summary=_tool_request("read", {"path": "a.py"}),
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+        )
+        assert summary.startswith("Found the culprit.")
+        assert "paused because the API rate limit was reached" in summary
+
+    def test_non_rate_limit_errors_still_propagate(self, tmp_path, monkeypatch):
+        def fake_cli_invoke(**kwargs):
+            raise ValueError("backend exploded")
+
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        with pytest.raises(ValueError):
+            run_tool_loop(
+                initial_summary=_tool_request("read", {"path": "a.py"}),
+                updated_files=[],
+                chat_id=1,
+                prompt="q",
+                conf=_conf(tmp_path),
+                base_system_prompt="sys",
+                source_files={},
+                max_output_tokens=1000,
+            )
 
 
 class TestStallGuard:

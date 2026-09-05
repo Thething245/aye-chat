@@ -596,6 +596,62 @@ class TestSpeculativeIntegration:
         )
         assert "PRE" in calls[0]["message"]
 
+    def test_structured_field_round_with_executor_still_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """tool_calls as a real field never streams as text, so the executor
+        has nothing to speculate on -- the tool must still run at round end."""
+        executed = []
+        calls = []
+
+        def fake_cli_invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "assistant_response": json.dumps(
+                        {
+                            "answer_summary": "Checking the layout.",
+                            "tool_call": [
+                                {"name": "glob", "arguments": {"pattern": "*.py"}}
+                            ],
+                        }
+                    ),
+                    "chat_id": 5,
+                }
+            return _resp("done", chat_id=6)
+
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.needs_confirmation", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            "aye.controller.tool_loop._execute",
+            lambda call, root, console=None: (
+                executed.append((call.name, call.arguments)) or "MATCHES"
+            ),
+        )
+        summary, _, chat_id = run_tool_loop(
+            initial_summary=_tool_request("glob", {"pattern": "*.txt"}),
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+            stream=True,
+            executor=SpeculativeExecutor(tmp_path, Console()),
+        )
+        # Two distinct calls (different patterns), each run exactly once: the
+        # round-1 JSON request, then the structured-field request.
+        assert executed == [
+            ("glob", {"pattern": "*.txt"}),
+            ("glob", {"pattern": "*.py"}),
+        ]
+        assert "MATCHES" in calls[0]["message"]
+        assert summary == "done"
+        assert chat_id == 6
+
     def test_executor_is_invalidated_after_a_mutating_round(
         self, tmp_path, monkeypatch
     ):

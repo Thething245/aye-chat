@@ -4,11 +4,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import aye.controller.tool_loop as tool_loop
-from aye.controller.tool_loop import run_tool_loop
+from aye.controller.tool_loop import SpeculativeExecutor, _call_key, run_tool_loop
 from aye.model.api import ApiError
-from aye.model.tool_protocol import looks_like_protocol_json
+from aye.model.tool_protocol import looks_like_protocol_json, split_summary
 
 
 @pytest.fixture(autouse=True)
@@ -444,6 +445,198 @@ class TestRateLimitHandling:
                 source_files={},
                 max_output_tokens=1000,
             )
+
+
+class TestSpeculativeExecutor:
+    """Mid-stream execution: tools run while the model is still writing."""
+
+    def _make(self, tmp_path, monkeypatch, executed):
+        monkeypatch.setattr(
+            "aye.controller.tool_loop._execute",
+            lambda call, root, console=None: (
+                executed.append((call.name, call.arguments)) or f"OUT[{call.name}]"
+            ),
+        )
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.get_user_config", lambda *a, **k: "off"
+        )
+        return SpeculativeExecutor(tmp_path, Console())
+
+    def test_runs_calls_as_their_object_completes(self, tmp_path, monkeypatch):
+        executed = []
+        ex = self._make(tmp_path, monkeypatch, executed)
+        cb = ex.wrap(lambda content, is_final=False: None)
+
+        cb("Let me look around first.", is_final=False)
+        assert executed == []
+
+        cb(
+            "Let me look.\n"
+            + _tool_request("read", {"path": "a.py"}),
+            is_final=False,
+        )
+        assert executed == [("read", {"path": "a.py"})]
+        assert ex.outputs()[_call_key(split_summary(_tool_request("read", {"path": "a.py"})).calls[0])] == "OUT[read]"
+
+        cb(
+            "Let me look.\n"
+            + _tool_request("read", {"path": "a.py"})
+            + "\nNow the greps.\n"
+            + _tool_request("grep", {"pattern": "x"}),
+            is_final=False,
+        )
+        assert executed == [
+            ("read", {"path": "a.py"}),
+            ("grep", {"pattern": "x"}),
+        ]
+
+    def test_same_call_is_not_executed_twice(self, tmp_path, monkeypatch):
+        executed = []
+        ex = self._make(tmp_path, monkeypatch, executed)
+        request = _tool_request("read", {"path": "a.py"})
+        cb = ex.wrap(lambda content, is_final=False: None)
+        cb(request, is_final=False)
+        cb(request + "\nagain:\n" + request, is_final=True)
+        assert executed == [("read", {"path": "a.py"})]
+
+    def test_confirmation_tools_are_left_to_the_loop(self, tmp_path, monkeypatch):
+        executed = []
+        self._make(tmp_path, monkeypatch, executed)
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.needs_confirmation", lambda *a, **k: True
+        )
+        ex = SpeculativeExecutor(tmp_path, Console())
+        ex.inspect(_tool_request("cmd", {"command": "pytest"}))
+        assert executed == []
+        # Noticed, so the loop's adoption path can see it was already handled.
+        assert ex.outputs() == {}
+
+    def test_execution_errors_become_text_and_never_break_the_stream(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.get_user_config", lambda *a, **k: "off"
+        )
+
+        def boom(call, root, console=None):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr("aye.controller.tool_loop._execute", boom)
+        ex = SpeculativeExecutor(tmp_path, Console())
+        delivered = []
+        cb = ex.wrap(lambda content, is_final=False: delivered.append(content))
+        cb(_tool_request("read", {"path": "a.py"}), is_final=False)
+        assert delivered  # the stream callback still ran
+        assert any("disk on fire" in out for out in ex.outputs().values())
+
+    def test_invalidate_forgets_everything(self, tmp_path, monkeypatch):
+        executed = []
+        ex = self._make(tmp_path, monkeypatch, executed)
+        ex.inspect(_tool_request("read", {"path": "a.py"}))
+        ex.invalidate()
+        assert ex.outputs() == {}
+        assert ex.printed == set()
+
+
+class TestSpeculativeIntegration:
+    """The loop adopts mid-stream outputs instead of re-running them."""
+
+    def _prefill(self, ex, request, output):
+        call = split_summary(request).calls[0]
+        ex._noticed.add(_call_key(call))
+        ex._outputs[_call_key(call)] = output
+
+    def test_preexecuted_call_is_not_rerun(self, tmp_path, monkeypatch):
+        request = _tool_request("read", {"path": "a.py"})
+        ex = SpeculativeExecutor(tmp_path, Console())
+        self._prefill(ex, request, "PRE")
+
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.cli_invoke",
+            lambda **kwargs: _resp("done", chat_id=1),
+        )
+        monkeypatch.setattr(
+            "aye.controller.tool_loop._execute",
+            lambda call, root, console=None: (_ for _ in ()).throw(
+                AssertionError("should not re-run")
+            ),
+        )
+        run_tool_loop(
+            initial_summary=request,
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+            executor=ex,
+        )
+
+    def test_followup_uses_the_preexecuted_output(self, tmp_path, monkeypatch):
+        request = _tool_request("read", {"path": "a.py"})
+        ex = SpeculativeExecutor(tmp_path, Console())
+        self._prefill(ex, request, "PRE")
+
+        calls = []
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.cli_invoke",
+            lambda **kwargs: calls.append(kwargs) or _resp("done", chat_id=1),
+        )
+        run_tool_loop(
+            initial_summary=request,
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+            executor=ex,
+        )
+        assert "PRE" in calls[0]["message"]
+
+    def test_executor_is_invalidated_after_a_mutating_round(
+        self, tmp_path, monkeypatch
+    ):
+        cmd_req = _tool_request("cmd", {"command": "touch a.py"})
+        read_req = _tool_request("read", {"path": "a.py"})
+        rounds = [read_req]
+        calls = []
+
+        def fake_cli_invoke(**kwargs):
+            calls.append(kwargs)
+            return _resp(rounds.pop(0) if rounds else "done", chat_id=1)
+
+        ex = SpeculativeExecutor(tmp_path, Console())
+        self._prefill(ex, read_req, "STALE")
+
+        executed = []
+        monkeypatch.setattr("aye.controller.tool_loop.cli_invoke", fake_cli_invoke)
+        monkeypatch.setattr(
+            "aye.controller.tool_loop.needs_confirmation", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            "aye.controller.tool_loop._execute",
+            lambda call, root, console=None: (
+                executed.append(call.name) or f"FRESH[{call.name}]"
+            ),
+        )
+        run_tool_loop(
+            initial_summary=cmd_req,
+            updated_files=[],
+            chat_id=1,
+            prompt="q",
+            conf=_conf(tmp_path),
+            base_system_prompt="sys",
+            source_files={},
+            max_output_tokens=1000,
+            executor=ex,
+        )
+        # The touch invalidated the prefilled read; it ran fresh instead.
+        assert "read" in executed
+        assert "FRESH[read]" in calls[1]["message"]
+        assert "STALE" not in calls[1]["message"]
 
 
 class TestStallGuard:

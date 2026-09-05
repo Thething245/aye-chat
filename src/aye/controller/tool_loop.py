@@ -9,6 +9,7 @@ until the model answers in prose or the round budget is exhausted.
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,7 +29,11 @@ from aye.model.tool_protocol import (
 )
 from aye.model.tools import build_registry, execute_tool, needs_confirmation
 from aye.presenter.streaming_ui import StreamingResponseDisplay, create_streaming_callback
-from aye.presenter.tool_presenter import SHELL_TOOL_NAMES, ToolSession
+from aye.presenter.tool_presenter import (
+    SHELL_TOOL_NAMES,
+    ToolSession,
+    present_tool_result,
+)
 from aye.presenter.ui_utils import StoppableSpinner, DEFAULT_THINKING_MESSAGES
 from aye.model.auth import get_user_config
 
@@ -155,6 +160,85 @@ def _execute(call: ToolCall, root: Path, console: Optional[Console] = None) -> s
     return execute_tool(call.name, call.arguments, root)
 
 
+class SpeculativeExecutor:
+    """Execute safe tool calls the moment their JSON completes in the stream.
+
+    The backend cannot inject results mid-generation, but it does stream every
+    reply while it is being produced. Watching the partial text lets calls
+    that need no user confirmation start -- and their activity lines print --
+    while the model is still writing, instead of every tool waiting for the
+    round to finish. The results are already waiting when the follow-up is
+    built, so a turn reads as narration, tool, narration, tool rather than
+    batch-then-wait.
+
+    The executor is cumulative across a request's rounds and thread-safe: it
+    runs on the stream-poller thread while the main thread waits on the API
+    call. Confirmation-requiring calls (shell in ``default`` mode) are noticed
+    but left for the loop to run at round end, so an interactive prompt never
+    fires from a background thread.
+    """
+
+    def __init__(self, root: Path, console: Console):
+        self._root = root
+        self._console = console
+        self._lock = threading.Lock()
+        self._noticed: set = set()
+        self._outputs: Dict[tuple, str] = {}
+        # Keys whose activity line was already printed live; the loop skips
+        # these when rendering the round so nothing appears twice.
+        self.printed: set = set()
+
+    def wrap(self, callback):
+        """Wrap a stream callback so every update feeds the executor first."""
+        def wrapped(content: str, is_final: bool = False) -> None:
+            try:
+                self.inspect(content)
+            except Exception:
+                # Speculation must never break the stream it watches.
+                pass
+            callback(content, is_final=is_final)
+        return wrapped
+
+    def inspect(self, content: str) -> None:
+        """Execute any not-yet-seen confirmation-free calls inside *content*."""
+        if not content or not content.strip():
+            return
+        calls = split_summary(content).calls
+        if not calls:
+            return
+        registry = build_registry()
+        for call in calls:
+            key = _call_key(call)
+            with self._lock:
+                if key in self._noticed:
+                    continue
+                self._noticed.add(key)
+            if needs_confirmation(call.name, registry):
+                continue
+            try:
+                output = _execute(call, self._root, console=self._console)
+            except Exception as exc:  # surfaced as text, like execute_tool
+                output = f"Error: {exc}"
+            with self._lock:
+                self._outputs[key] = output
+                if _is_verbose() or _is_debug():
+                    self.printed.add(key)
+            if key in self.printed:
+                present_tool_result(call, output, self._console)
+
+    def outputs(self) -> Dict[tuple, str]:
+        """Snapshot of call-key to output for every speculatively run call."""
+        with self._lock:
+            return dict(self._outputs)
+
+    def invalidate(self) -> None:
+        """Forget everything: a mutating call made earlier outputs stale."""
+        with self._lock:
+            self._noticed.clear()
+            self._outputs.clear()
+            self.printed.clear()
+
+
 def _print_narration(console: Console, narration: str) -> None:
     """Show the model's prose that accompanied a tool request.
 
@@ -175,6 +259,7 @@ def _invoke_round(
     attachments: Optional[List[Dict[str, Any]]],
     console: Console,
     stream: bool,
+    executor: Optional[SpeculativeExecutor] = None,
 ) -> Tuple[Dict[str, Any], Optional[StreamingResponseDisplay], Dict[str, Any]]:
     """Send one round's follow-up and stream its reply like a first response.
 
@@ -193,6 +278,8 @@ def _invoke_round(
     if stream:
         display = StreamingResponseDisplay(on_first_content=spinner.stop)
         callback = create_streaming_callback(display, state=round_state)
+        if executor is not None:
+            callback = executor.wrap(callback)
 
     spinner.start()
     try:
@@ -253,6 +340,7 @@ def run_tool_loop(
     stream: bool = False,
     initial_narration_shown: bool = False,
     initial_narration: str = "",
+    executor: Optional[SpeculativeExecutor] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[int]]:
     """Run tool rounds until the model answers in prose or the budget runs out.
@@ -285,6 +373,10 @@ def run_tool_loop(
             the caller's streaming display (suppress the dim echo).
         initial_narration: Round 1's prose when its tool request arrived as a
             structured field (which replaces, and so hides, the prose).
+        executor: Shared :class:`SpeculativeExecutor`. When streaming, it runs
+            confirmation-free calls mid-stream; the loop adopts their outputs
+            instead of executing the same calls again. Created on demand when
+            None and streaming.
         state: Optional out-dict; ``state["summary_already_printed"]`` is set
             when the final answer was rendered by this loop's stream.
 
@@ -298,6 +390,8 @@ def run_tool_loop(
     root = Path(getattr(conf, "root", None) or Path.cwd())
     console = console if console is not None else Console()
     state = state if state is not None else {}
+    if stream and executor is None:
+        executor = SpeculativeExecutor(root, console)
 
     # Outputs of calls already executed this request, keyed by name+arguments.
     # parse_tool_calls() deduplicates within a round; this carries across them.
@@ -347,27 +441,41 @@ def run_tool_loop(
             round_results: List[tuple] = []
             ran_mutating = False
             executed_any_new = False
+            # Calls the executor already ran mid-stream come with outputs and
+            # (on verbose/debug) printed activity lines; adopt, never redo.
+            precomputed = executor.outputs() if executor is not None else {}
+            printed = set(executor.printed) if executor is not None else set()
             for call in parsed.calls:
                 key = _call_key(call)
                 if key in seen_calls:
                     # Replay the earlier result rather than running it again.
                     output = _REPEATED_CALL_NOTE + seen_calls[key]
+                    fresh = False
+                elif key in precomputed:
+                    output = precomputed[key]
+                    seen_calls[key] = output
+                    fresh = True
                 else:
                     output = _execute(call, root, console=console)
                     seen_calls[key] = output
+                    fresh = True
+                if fresh:
                     executed_any_new = True
                     if call.name in _MUTATING_TOOLS:
                         ran_mutating = True
                 round_results.append((call, output))
-                if call.name in SHELL_TOOL_NAMES:
-                    session.add_shell_result(call, output)
-                else:
-                    session.add_call_line(call, output)
+                if key not in printed:
+                    if call.name in SHELL_TOOL_NAMES:
+                        session.add_shell_result(call, output)
+                    else:
+                        session.add_call_line(call, output)
 
             # A command may have changed the files; remembered outputs are
             # potentially stale, so repeated calls must run again.
             if ran_mutating:
                 seen_calls.clear()
+                if executor is not None:
+                    executor.invalidate()
 
             # No new output this round means the model is re-requesting work
             # it already has. Give it a few chances to self-correct, then
@@ -421,6 +529,7 @@ def run_tool_loop(
                 attachments=attachments,
                 console=console,
                 stream=stream,
+                executor=executor,
             )
         except _RateLimitedTurn:
             rate_limited = True
@@ -479,6 +588,7 @@ def run_tool_loop(
                 attachments=attachments,
                 console=console,
                 stream=stream,
+                executor=executor,
             )
         except _RateLimitedTurn:
             narration = split_summary(summary).narration or pending_narration

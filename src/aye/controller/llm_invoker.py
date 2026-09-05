@@ -573,6 +573,19 @@ def invoke_llm(
         stream_state: Dict[str, Any] = {}
         stream_callback = create_streaming_callback(streaming_display, state=stream_state)
 
+        # With tools available, watch the stream for completed tool-call
+        # objects and run the confirmation-free ones while the model is still
+        # writing, so results wait for the follow-up instead of the other way
+        # around.
+        speculative_executor = None
+        if bool(build_registry()):
+            from aye.controller.tool_loop import SpeculativeExecutor
+
+            speculative_executor = SpeculativeExecutor(
+                Path(getattr(conf, "root", None) or Path.cwd()), console
+            )
+            stream_callback = speculative_executor.wrap(stream_callback)
+
         api_resp = cli_invoke(
             message=prompt,
             chat_id=chat_id or -1,
@@ -666,6 +679,7 @@ def invoke_llm(
                 stream=streaming_display is not None,
                 initial_narration_shown=narration_shown,
                 initial_narration=initial_narration,
+                executor=speculative_executor,
                 state=loop_state,
             )
             return LLMResponse(
